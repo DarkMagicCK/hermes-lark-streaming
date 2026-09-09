@@ -423,6 +423,7 @@ class StreamCardController(StreamingController):
         message_id: str,
         answer: str = "",
         is_error: bool = False,
+        reconcile_answer: bool = False,
         duration: float = 0.0,
         model: str = "",
         tokens: dict | None = None,
@@ -470,6 +471,7 @@ class StreamCardController(StreamingController):
         self._apply_completion_payload(
             session=session,
             answer=answer,
+            reconcile_answer=reconcile_answer,
             duration=duration,
             model=model,
             tokens=tokens,
@@ -654,12 +656,29 @@ class StreamCardController(StreamingController):
         model: str,
         tokens: dict | None,
         context: dict | None,
+        reconcile_answer: bool = False,
     ) -> None:
-        if answer and session.segment_state and not any(
-            seg.type == SegmentType.ANSWER for seg in session.segment_state.segments
-        ):
+        if answer and session.segment_state:
             final_answer = strip_reasoning_tags(answer)
-            if final_answer:
+            latest_answer = next(
+                (seg for seg in reversed(session.active_segments()) if seg.type == SegmentType.ANSWER),
+                None,
+            )
+            if final_answer and reconcile_answer:
+                if latest_answer is not None and final_answer.startswith(latest_answer.text):
+                    suffix = final_answer[len(latest_answer.text):]
+                    if suffix:
+                        latest_answer.text += suffix
+                        latest_answer.dirty = True
+                else:
+                    # Keep useful partial output and separate the authoritative final notice.
+                    separator = "\n\n" if session.segment_state.segments and (
+                        session.segment_state.segments[-1].type == SegmentType.ANSWER
+                    ) else ""
+                    session.segment_state.on_answer_delta(separator + final_answer)
+            elif final_answer and not any(
+                seg.type == SegmentType.ANSWER for seg in session.segment_state.segments
+            ):
                 session.segment_state.on_answer_delta(final_answer)
 
         session.footer = {
