@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Preserve native Hermes topic-delivery policy for failed streaming cards and background tasks.
+- Carry topic/event context through start and queued-follow-up hooks; keep valid replies explicitly in-thread.
+- Yield stale cards when native routing stops, recovers, or redirects; guard updates and transient retries across awaits.
+- Preserve native-confirmed queued delivery and authoritative topic IDs on events without raw Lark payloads.
+- Add isolated real-SDK integration checks and gateway/cron patch round-trip verification for topic-policy Hermes builds.
+
 ## [0.13.0] - 2026-09-22
 
 ### 变更

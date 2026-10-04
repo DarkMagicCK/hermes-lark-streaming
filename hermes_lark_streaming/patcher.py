@@ -232,6 +232,8 @@ def _start_hook(indent: str) -> str:
             "            message_id=event.message_id,",
             "            chat_id=source.chat_id,",
             "            anchor_id=_lark_anchor_id,",
+            "            event=event,",
+            "            thread_id=getattr(source, 'thread_id', None),",
             "            session_key=locals().get('session_key') or locals().get('_quick_key'),",
             "        )",
             *_hook_exception_lines("start"),
@@ -267,7 +269,9 @@ def _complete_body(indent: str) -> str:
         "        if agent_result.get('failed'):",
         "            response = ''",
         "    elif on_message_needs_text_fallback(message_id=_lark_completion_id):",
-        "        agent_result.pop('already_sent', None)",
+        "        # A native queued send has already confirmed this response when the receipt exists.",
+        "        if 'media_already_delivered' not in agent_result:",
+        "            agent_result.pop('already_sent', None)",
         *_hook_exception_lines("complete"),
     ]
     return "".join(f"{indent}{line}\n" for line in lines)
@@ -362,6 +366,7 @@ def _bg_deliver_hook(indent: str) -> str:
             "            preview=_bg_preview,",
             "            content=text_content,",
             "            reply_to_message_id=event_message_id,",
+            "            thread_id=getattr(source, 'thread_id', None),",
             "        ):",
             "            text_content = ''",
             "            if not images and not media_files:",

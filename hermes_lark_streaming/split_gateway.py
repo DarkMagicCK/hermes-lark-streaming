@@ -280,12 +280,15 @@ def inject_gateway(filename: str, content: str) -> str:
                 if result.get('interrupted') and _lark_next_id:
                     on_message_interrupted(message_id={turn_identity}, new_message_id=_lark_next_id,
                                            chat_id=next_source.chat_id, anchor_id=next_message_id,
+                                           thread_id=getattr(next_source, 'thread_id', None), event=pending_event,
                                            session_key=next_session_key)
                 elif result.get('interrupted'):
                     on_message_aborted(message_id={turn_identity})
                 elif _lark_next_id:
                     on_message_started(message_id=_lark_next_id, chat_id=next_source.chat_id,
-                                       anchor_id=next_message_id, session_key=next_session_key)
+                                       anchor_id=next_message_id,
+                                       thread_id=getattr(next_source, 'thread_id', None), event=pending_event,
+                                       session_key=next_session_key)
         """))
         # Older split gateways omit the inbound identity; newer ones already carry it.
         value = node.value if isinstance(node, ast.Assign) else None

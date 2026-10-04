@@ -148,6 +148,8 @@ class StreamCardController(StreamingController):
         message_id: str | None,
         chat_id: str,
         anchor_id: str | None = None,
+        thread_id: str | None = None,
+        delivery_guard: Callable[[], bool] | None = None,
         session_key: str | None = None,
     ) -> None:
         """消息处理开始 — 创建会话 + 发占位卡片."""
@@ -165,7 +167,7 @@ class StreamCardController(StreamingController):
         if loop is None:
             _logger.warning("no event loop available, skipping: msg=%s", message_id[:12])
             return
-        session = CardSession(message_id, chat_id, loop)
+        session = CardSession(message_id, chat_id, loop, thread_id=thread_id, delivery_guard=delivery_guard)
         session.session_key = session_key
         self._sessions[message_id] = session
         if session_key:
@@ -334,6 +336,8 @@ class StreamCardController(StreamingController):
         new_message_id: str,
         chat_id: str,
         anchor_id: str | None = None,
+        thread_id: str | None = None,
+        delivery_guard: Callable[[], bool] | None = None,
         session_key: str | None = None,
     ) -> None:
         """用户发送新消息导致前一条消息被中断 — abort A + create B."""
@@ -356,7 +360,7 @@ class StreamCardController(StreamingController):
             loop = self._get_loop()
             if loop is not None:
                 reply_anchor_id = anchor_id if anchor_id and anchor_id != new_message_id else None
-                session = CardSession(new_message_id, chat_id, loop)
+                session = CardSession(new_message_id, chat_id, loop, thread_id=thread_id, delivery_guard=delivery_guard)
                 session.anchor_id = reply_anchor_id
                 session.session_key = session_key
                 self._sessions[new_message_id] = session
@@ -522,9 +526,11 @@ class StreamCardController(StreamingController):
         preview: str,
         content: str,
         reply_to_message_id: str | None = None,
+        thread_id: str | None = None,
     ) -> bool:
         """Background 任务完成推送 — 包装为静态卡片发送，成功返回 True."""
-        if not self.enabled or not content or not chat_id:
+        # Native Hermes owns topic recovery, fallback policy, and delivery state.
+        if thread_id or not self.enabled or not content or not chat_id:
             return False
         try:
             await self._do_background_deliver(

@@ -26,7 +26,7 @@ Inspired by [openclaw-lark](https://github.com/larksuite/openclaw-lark) and [her
 - **Image resolution** — Detects markdown image references, downloads and re-uploads as Feishu img_key
 - **Abort handling** — Gracefully handles `/stop` command and message interrupts with aborted state card and automatic new session
 - **Cron card delivery** — Delivers scheduled job results as Feishu cards, preserving Markdown rendering
-- **Background task card delivery** — Delivers `/background` (`/btw`) task results as cards, with topic-aware reply
+- **Background task card delivery** — Delivers flat-chat `/background` (`/btw`) results as cards; topic tasks retain native Hermes delivery
 - **i18n** — Built-in Chinese/English bilingual card text (status, tool panel, thinking labels, etc.) that auto-switches based on Feishu client language
 
 ---
@@ -50,6 +50,29 @@ When long conversations or excessive tool steps cause the card to approach Feish
 - Feishu app permissions: CardKit read/write, message send & reply, image upload
 
 ---
+
+## Topic delivery policy compatibility
+
+Hermes remains the sole owner of topic recovery and the
+`platforms.feishu.extra.topic_delivery_fallback` setting:
+
+- `main_chat` (default): deliver the original response to the parent chat when topic recovery is exhausted
+- `error_notice`: send only Hermes's safe diagnostic to the parent chat
+- `silent`: record the failure in backend logs without a parent-chat message
+
+These modes require a Hermes build that implements the setting. This plugin does
+not add or reinterpret the policy on older Hermes versions.
+
+Valid topic conversations still use streaming cards with explicit in-thread
+replies. Failed topic card creation yields the complete response to Hermes;
+it never creates a parent-chat card as its own fallback. Topic background and
+cron deliveries stay native, including attachment handling. When Hermes stops,
+recovers, or redirects a turn's destination, the old card yields to native
+completion. Already-submitted requests cannot be recalled; subsequent updates
+and retries check that the card still owns delivery.
+
+Re-run `verify` and `install` after upgrading this plugin so existing injected
+hooks receive the topic and event context. Flat-chat card behavior is unchanged.
 
 ## Installation
 
@@ -247,3 +270,17 @@ Thanks to our contributors for their issues and pull requests:
 ## License
 
 [MIT](LICENSE)
+
+### Verify against a topic-policy Hermes checkout
+
+Use an explicit, disposable-test target. This command imports that checkout,
+mocks all SDK transports and agent execution, and patches only temporary copies:
+
+```bash
+$HERMES_PYTHON tests/check_topic_policy_integration.py /path/to/hermes-agent
+```
+
+It verifies all three policies, native background/final delivery, recovery,
+status and redirect handling, plus byte-identical gateway/cron
+install-reinstall-remove round trips. The normal test suite still checks the
+pinned Hermes 0.21.1 layout for backward compatibility.

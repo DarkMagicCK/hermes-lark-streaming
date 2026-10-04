@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
-from typing import TYPE_CHECKING, Any
+from collections.abc import Awaitable, Callable, Coroutine
+from functools import wraps
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast
 
 from ..cardkit.builder import build_background_card, build_complete_card, build_cron_card, build_streaming_card_v2
 from ..cardkit.markdown import (
@@ -18,6 +19,7 @@ from ..feishu import (
     CARDKIT_RATE_LIMITED,
     CARDKIT_STREAMING_CLOSED,
     FeishuAPIError,
+    topic_delivery_scope,
 )
 from .diagnostics import compact_ids, extract_missing_element_id, segment_state_for_log, summarize_actions
 from .flush import CARDKIT_MS
@@ -63,6 +65,19 @@ async def _resolve_answer_images(
             _logger.debug("%s image resolve failed: el=%s", log_prefix, seg.el_id, exc_info=True)
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _guard_topic_calls(func: Callable[_P, Awaitable[_R]]) -> Callable[_P, Coroutine[Any, Any, _R]]:
+    @wraps(func)
+    async def guarded(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        session = cast("CardSession", args[1] if len(args) > 1 else kwargs["session"])
+        with topic_delivery_scope(session.delivery_guard):
+            return await func(*args, **kwargs)
+    return guarded
+
+
 class StreamingController:
     """流式卡片专用方法 — 由 StreamCardController 继承."""
 
@@ -98,9 +113,19 @@ class StreamingController:
         self._schedule_flush(session)
         return True
 
+    def _topic_delivery_allowed(self, session: CardSession) -> bool:
+        if session.delivery_guard is None or session.delivery_guard():
+            return True
+        # Do not claim the card delivered after native routing changed or stopped.
+        if hasattr(self, "_mark_text_fallback_needed"):
+            self._mark_text_fallback_needed(session)
+        session.mark_failed()
+        return False
+
+    @_guard_topic_calls
     async def _do_create_card(self, session: CardSession) -> None:
         """创建只有 loading 的流式占位卡片."""
-        if session.state != SessionState.IDLE:
+        if not self._topic_delivery_allowed(session) or session.state != SessionState.IDLE:
             return
         session.state = SessionState.CREATING
 
@@ -114,25 +139,37 @@ class StreamingController:
                 width_mode=self._cfg.width_mode,
             )
             card_id = await self._client.cardkit_create(card)
+            if not self._topic_delivery_allowed(session):
+                return
             try:
                 card_msg_id = await self._client.reply_card_by_id(
                     reply_to_message_id,
                     card_id,
+                    **({"reply_in_thread": True} if session.thread_id else {}),
                 )
             except FeishuAPIError as error:
                 if error.code != CARDKIT_CONTENT_FAILED:
                     raise
                 card_id = await self._client.cardkit_create(card)
+                if not self._topic_delivery_allowed(session):
+                    return
                 try:
                     card_msg_id = await self._client.reply_card_by_id(
                         reply_to_message_id,
                         card_id,
+                        **({"reply_in_thread": True} if session.thread_id else {}),
                     )
                 except FeishuAPIError:
+                    # Never move topic content into the parent chat here. Hermes
+                    # must apply its recovery and configured fallback policy.
+                    if session.thread_id:
+                        raise
                     card_msg_id = await self._client.send_card_to_chat(
                         chat_id=session.chat_id,
                         card={"type": "card", "data": {"card_id": card_id}},
                     )
+            if not self._topic_delivery_allowed(session):
+                return
             session.set_card(card_id=card_id, card_msg_id=card_msg_id)
             session.element_count = 1  # loading element
             session.flush.set_throttle(CARDKIT_MS)
@@ -162,9 +199,10 @@ class StreamingController:
             _logger.exception("_do_create_card failed")
             session.mark_failed()
 
+    @_guard_topic_calls
     async def _do_flush(self, session: CardSession) -> None:
         """幂等 flush：按 segment 顺序处理结构性变更，超阈值时拆卡."""
-        if session.state.is_terminal or not session.card_id:
+        if not self._topic_delivery_allowed(session) or session.state.is_terminal or not session.card_id:
             return
         segment_state = session.segment_state
 
@@ -296,6 +334,8 @@ class StreamingController:
 
         # ── 步骤 2: stream_element 刷脏文本 ──
         for seg in segments[session.split_index:]:
+            if not self._topic_delivery_allowed(session):
+                return
             if not seg.created or not seg.dirty:
                 continue
             try:
@@ -337,6 +377,7 @@ class StreamingController:
             except Exception as e:
                 _logger.debug("CardKit stream element failed: %s el=%s", e, seg.el_id, exc_info=True)
 
+    @_guard_topic_calls
     async def _do_batch_update(
         self,
         session: CardSession,
@@ -349,6 +390,8 @@ class StreamingController:
         """执行 batch_update 并处理快照/标记。返回 False 表示失败."""
         assert self._client is not None
         assert session.card_id is not None
+        if not self._topic_delivery_allowed(session):
+            return False
         session.sequence += 1
         _logger.info(
             "CardKit batch update: msg=%s card=%s seq=%d actions=%d split=%d elements=%d",
@@ -494,6 +537,7 @@ class StreamingController:
             return "failed"
         return "split"
 
+    @_guard_topic_calls
     async def _seal_current_card(
         self,
         session: CardSession,
@@ -509,7 +553,7 @@ class StreamingController:
         """
         assert self._client is not None
         old_card_id = card_id or session.card_id
-        if not old_card_id:
+        if not old_card_id or not self._topic_delivery_allowed(session):
             return
         if session.image_resolver:
             await _resolve_answer_images(
@@ -530,10 +574,14 @@ class StreamingController:
             show_tool_use=self._cfg.show_tool_use,
             width_mode=self._cfg.width_mode,
         )
+        if not self._topic_delivery_allowed(session):
+            return
         try:
             seq = session.sequence if sequence is None else sequence
             seq += 1
             await self._client.cardkit_close_streaming(old_card_id, sequence=seq)
+            if not self._topic_delivery_allowed(session):
+                return
             seq += 1
             await self._client.cardkit_update(old_card_id, seal_card, sequence=seq)
         except Exception:
@@ -543,6 +591,7 @@ class StreamingController:
                 exc_info=True,
             )
 
+    @_guard_topic_calls
     async def _create_streaming_card(self, session: CardSession) -> tuple[str, str] | None:
         """创建空白流式卡并挂到 anchor，返回 (card_id, msg_id)。失败返回 None。
 
@@ -555,8 +604,11 @@ class StreamingController:
                 width_mode=self._cfg.width_mode,
             )
             new_card_id = await self._client.cardkit_create(card)
+            if not self._topic_delivery_allowed(session):
+                return None
             new_msg_id = await self._client.reply_card_by_id(
                 session.anchor_id or session.message_id, new_card_id,
+                **({"reply_in_thread": True} if session.thread_id else {}),
             )
         except Exception:
             _logger.warning(
@@ -564,6 +616,8 @@ class StreamingController:
                 session.message_id[:12],
                 exc_info=True,
             )
+            return None
+        if not self._topic_delivery_allowed(session):
             return None
         return new_card_id, new_msg_id
 
@@ -697,8 +751,9 @@ class StreamingController:
             self._flush_deferred_background_reviews(session)
             self._cleanup_session(session)
 
+    @_guard_topic_calls
     async def _do_complete_card_inner(self, session: CardSession) -> bool:
-        if session.guard.should_skip("_do_complete_card"):
+        if not self._topic_delivery_allowed(session) or session.guard.should_skip("_do_complete_card"):
             return False
 
         await session.flush.wait_for_flush()
@@ -739,6 +794,8 @@ class StreamingController:
 
         streaming_closed = False
         for attempt in range(3):
+            if not self._topic_delivery_allowed(session):
+                return False
             try:
                 assert self._client is not None
                 if session.card_id:
@@ -749,12 +806,16 @@ class StreamingController:
                             sequence=session.sequence,
                         )
                         streaming_closed = True
+                    if not self._topic_delivery_allowed(session):
+                        return False
                     session.sequence += 1
                     await self._client.cardkit_update(
                         session.card_id,
                         card,
                         sequence=session.sequence,
                     )
+                if not self._topic_delivery_allowed(session):
+                    return False
                 session.state = SessionState.COMPLETED
                 return True
             except FeishuAPIError as e:

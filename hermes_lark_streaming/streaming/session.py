@@ -52,6 +52,7 @@ class CardSession:
         "deferred_background_review_closed",
         "deferred_background_review_lock",
         "deferred_background_reviews",
+        "delivery_guard",
         "element_count",
         "flush",
         "footer",
@@ -64,6 +65,7 @@ class CardSession:
         "split_disabled",
         "split_index",
         "state",
+        "thread_id",
         "tool_use",
     )
 
@@ -72,10 +74,15 @@ class CardSession:
         message_id: str,
         chat_id: str,
         loop: asyncio.AbstractEventLoop,
+        *,
+        thread_id: str | None = None,
+        delivery_guard: Callable[[], bool] | None = None,
     ) -> None:
         self.message_id = message_id
         self.anchor_id: str | None = None
         self.chat_id = chat_id
+        self.thread_id = thread_id
+        self.delivery_guard = delivery_guard
         self.session_key: str | None = None
         self.create_task: asyncio.Future[Any] | ConcurrentFuture | None = None
         self.state = SessionState.IDLE

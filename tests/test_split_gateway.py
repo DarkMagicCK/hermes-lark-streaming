@@ -393,7 +393,8 @@ async def test_completion_footer_failure_silence_and_cleanup(
     owner._hmwa_agent_error_reply.assert_not_called()
     owner._clear_session_env.assert_called_once()
     assert hooks.on_message_started.call_args.kwargs == dict(message_id="inbound", chat_id="chat",
-                                                            anchor_id="quoted-anchor", session_key="session")
+                                                            anchor_id="quoted-anchor", thread_id=None, event=event,
+                                                            session_key="session")
     if silent:
         hooks.on_message_completed_wait.assert_not_awaited()
         assert response in (None, "")
@@ -592,7 +593,7 @@ async def test_background_inner_delivery_keeps_attachments(patched, hooks, monke
                 BasePlatformAdapter=NS(filter_media_delivery_paths=lambda files: files))
     await fn(owner, "prompt", context().source, "task", event_message_id="quote")
     hooks.on_background_deliver.assert_awaited_once_with(chat_id="chat", preview="prompt", content="answer",
-                                                        reply_to_message_id="quote")
+                                                        reply_to_message_id="quote", thread_id=None)
     assert adapter.send.call_count == int(not owned)
     assert adapter.send_image.call_count == int(media)
     assert adapter.send_document.call_count == int(media)

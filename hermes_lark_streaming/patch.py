@@ -105,11 +105,42 @@ def on_feishu_normalize(
             reply_to,
         )
 
-        if reply_to and source_thread_id and not real_thread_id:
+        # Older adapters mistook a quoted root message for a topic. Only repair
+        # that proven legacy shape; missing raw data is not proof of a flat chat.
+        raw_root_id = (raw_message.get("root_id") if isinstance(raw_message, dict)
+                       else getattr(raw_message, "root_id", None))
+        if reply_to and source_thread_id and source_thread_id == raw_root_id and not real_thread_id:
             source.thread_id = None
             event.source = source
     except Exception as exc:
         _logger.warning("on_feishu_normalize error: %s", exc, exc_info=True)
+
+
+def _topic_delivery_guard(
+    event: Any, thread_id: str | None, anchor_id: str | None,
+) -> Callable[[], bool] | None:
+    """Yield when native Hermes changes this event's destination or stops delivery."""
+    if not thread_id or event is None:
+        return None
+    inbound_id = getattr(event, "message_id", None)
+
+    def allowed() -> bool:
+        if getattr(event, "ledger_message_id", None) not in (None, inbound_id):
+            return False
+        if getattr(event, "reply_anchor_override", None) not in (None, anchor_id):
+            return False
+        terminal = getattr(event, "_delivery_retry_suppressed_result", None)
+        if getattr(terminal, "retry_suppressed", False) is True:
+            return False
+        state = getattr(event, "_feishu_topic_delivery", None)
+        if isinstance(state, dict):
+            if state.get("terminal") is not None or state.get("destination") == "main_chat":
+                return False
+            if state.get("anchor") and state["anchor"] != anchor_id:
+                return False
+        return True
+
+    return allowed
 
 
 @_safe_hook()
@@ -119,6 +150,8 @@ def on_message_started(
     message_id: str,
     chat_id: str,
     anchor_id: str | None = None,
+    thread_id: str | None = None,
+    event: Any = None,
     session_key: str | None = None,
 ) -> None:
     """[注入点 1] 函数开头 — message.started."""
@@ -126,6 +159,8 @@ def on_message_started(
         message_id=message_id,
         chat_id=chat_id,
         anchor_id=anchor_id,
+        thread_id=thread_id,
+        delivery_guard=_topic_delivery_guard(event, thread_id, anchor_id or message_id),
         session_key=session_key,
     )
 
@@ -280,6 +315,8 @@ def on_message_interrupted(
     new_message_id: str,
     chat_id: str,
     anchor_id: str | None = None,
+    thread_id: str | None = None,
+    event: Any = None,
     session_key: str | None = None,
 ) -> None:
     """[注入点 9] interrupt 发生 — message.interrupted."""
@@ -288,6 +325,8 @@ def on_message_interrupted(
         new_message_id=new_message_id,
         chat_id=chat_id,
         anchor_id=anchor_id,
+        thread_id=thread_id,
+        delivery_guard=_topic_delivery_guard(event, thread_id, anchor_id or new_message_id),
         session_key=session_key,
     )
 
@@ -320,6 +359,7 @@ async def on_background_deliver(
     preview: str,
     content: str,
     reply_to_message_id: str | None = None,
+    thread_id: str | None = None,
 ) -> bool:
     """[注入点 11] background 任务完成推送 — 包装为飞书卡片发送."""
     try:
@@ -331,6 +371,7 @@ async def on_background_deliver(
             preview=preview,
             content=content,
             reply_to_message_id=reply_to_message_id,
+            thread_id=thread_id,
         )
     except Exception as exc:
         _logger.warning("on_background_deliver error: %s", exc, exc_info=True)

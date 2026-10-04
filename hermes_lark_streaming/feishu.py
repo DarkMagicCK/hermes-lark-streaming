@@ -8,6 +8,9 @@ import json
 import logging
 import re
 import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
@@ -53,6 +56,19 @@ CARDKIT_TRANSIENT_ERROR_CODES = frozenset(
     }
 )
 _TRANSIENT_RETRY_DELAYS_SEC = (0.15, 0.5, 1.0)
+
+
+_topic_delivery_guard: ContextVar[Callable[[], bool] | None] = ContextVar("lark_topic_delivery_guard", default=None)
+
+
+@contextmanager
+def topic_delivery_scope(guard: Callable[[], bool] | None) -> Iterator[None]:
+    """Keep retry permission local to the current card task, including nested calls."""
+    token = _topic_delivery_guard.set(guard)
+    try:
+        yield
+    finally:
+        _topic_delivery_guard.reset(token)
 
 
 def _sanitize_message(msg: str) -> str:
@@ -138,6 +154,9 @@ class FeishuClient:
         attempts = len(_TRANSIENT_RETRY_DELAYS_SEC) + 1
         last_error: FeishuAPIError | None = None
         for attempt in range(attempts):
+            guard = _topic_delivery_guard.get()
+            if guard is not None and not guard():
+                raise FeishuAPIError("Topic delivery returned to Hermes")
             resp = await call()
             try:
                 self._check(resp, operation)
@@ -207,19 +226,22 @@ class FeishuClient:
             return str(resp.data.message_id)
         raise FeishuAPIError("send_card_to_chat: response missing message_id")
 
-    async def reply_card_by_id(self, message_id: str, card_id: str) -> str:
+    async def reply_card_by_id(
+        self, message_id: str, card_id: str, *, reply_in_thread: bool = False,
+    ) -> str:
         """通过 card_id 回复 CardKit 卡片消息，返回 message_id."""
-        request_uuid = uuid.uuid4().hex
+        body = (
+            ReplyMessageRequestBody.builder()
+            .msg_type("interactive")
+            .content(self._dumps({"type": "card", "data": {"card_id": card_id}}))
+            .uuid(uuid.uuid4().hex)
+        )
+        if reply_in_thread:
+            body.reply_in_thread(True)
         request = (
             ReplyMessageRequest.builder()
             .message_id(message_id)
-            .request_body(
-                ReplyMessageRequestBody.builder()
-                .msg_type("interactive")
-                .content(self._dumps({"type": "card", "data": {"card_id": card_id}}))
-                .uuid(request_uuid)
-                .build()
-            )
+            .request_body(body.build())
             .build()
         )
         resp = await self._checked_call(
