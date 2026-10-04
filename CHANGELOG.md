@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Yield streaming cards to native `parent_chat` and `parent_then_home` routing, including HomeChannel selection.
 - Preserve native Hermes topic-delivery policy for failed streaming cards and background tasks.
 - Carry topic/event context through start and queued-follow-up hooks; keep valid replies explicitly in-thread.
 - Yield stale cards when native routing stops, recovers, or redirects; guard updates and transient retries across awaits.

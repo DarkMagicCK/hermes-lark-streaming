@@ -134,7 +134,7 @@ def _topic_delivery_guard(
             return False
         state = getattr(event, "_feishu_topic_delivery", None)
         if isinstance(state, dict):
-            if state.get("terminal") is not None or state.get("destination") == "main_chat":
+            if state.get("terminal") is not None or state.get("destination") in {"parent_chat", "home"}:
                 return False
             if state.get("anchor") and state["anchor"] != anchor_id:
                 return False

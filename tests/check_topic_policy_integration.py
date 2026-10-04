@@ -62,7 +62,9 @@ def checksum(paths):
 
 
 def core_adapter(policy, scenario):
-    core = core_module.FeishuAdapter(PlatformConfig(extra={"topic_delivery_fallback": policy}))
+    core = core_module.FeishuAdapter(PlatformConfig(extra={
+        "topic_delivery_fallback": policy, "app_id": "test-app", "app_secret": "test-secret",
+    }))
     core._client = Mock()
     messages = core._client.im.v1.message
     messages.create.return_value = ok(message_id="om_core_parent")
@@ -152,7 +154,7 @@ async def native_background(generated, core, event, mp, attachments):
 
 async def run_matrix(generated, home):
     results = []
-    for policy in ("main_chat", "error_notice", "silent"):
+    for policy in ("parent_chat", "parent_then_home", "error_notice", "silent"):
         for lane in ("background", "normal", "status", "redirect"):
             scenarios = ("missing", "stale", "stale231003", "recovered", "lookup_failed",
                          "valid", "permission", "rate_limit", "timeout")
@@ -219,10 +221,10 @@ async def run_matrix(generated, home):
                     exhausted = scenario in ("missing", "stale", "stale231003", "lookup_failed", "content_rejection")
                     if exhausted and lane != "redirect":
                         expected = 0 if policy == "silent" else 1
-                        if policy == "main_chat" and lane in ("background", "status"):
+                        if policy in ("parent_chat", "parent_then_home") and lane in ("background", "status"):
                             expected = 2
                         assert len(parent_payloads) == expected, (policy, lane, scenario, parent_payloads)
-                        if policy == "main_chat":
+                        if policy in ("parent_chat", "parent_then_home"):
                             assert any("ORIGINAL_BODY" in payload for payload in parent_payloads)
                     if scenario in ("permission", "rate_limit", "timeout"):
                         assert not parent_payloads
@@ -245,6 +247,123 @@ async def run_matrix(generated, home):
                     executor = getattr(core, "_sdk_executor", None)
                     if executor:
                         executor.shutdown(wait=True)
+    return results
+
+
+
+def profile_config(home, home_kind):
+    """Write a real profile config; native Hermes resolves HomeChannel itself."""
+    selected = {"platform": "feishu", "chat_id": "oc_home", "name": "Test home"}
+    if home_kind == "same_chat":
+        selected["chat_id"] = "oc_origin"
+    elif home_kind == "wrong_platform":
+        selected["platform"] = "slack"
+    elif home_kind == "blank":
+        selected["chat_id"] = " "
+    elif home_kind == "topic":
+        selected["thread_id"] = "omt_home"
+    settings = {"enabled": True, "extra": {"app_id": "test-app", "app_secret": "test-secret"}}
+    if home_kind != "missing":
+        settings["home_channel"] = selected
+    (home / "config.yaml").write_text(json.dumps({"platforms": {"feishu": settings}}))
+
+
+async def run_home_matrix(generated, home):
+    # The plugin never resolves a HomeChannel or applies fallback policy. Exercise
+    # native routing through the generated hooks, with real SDK request builders.
+    cases = [(policy, lane, "flat", 232009)
+             for policy in ("parent_chat", "parent_then_home", "error_notice", "silent")
+             for lane in ("normal", "background", "status", "active_card")]
+    cases += [("parent_then_home", "normal", "flat", failure)
+              for failure in (230002, 99991663, 230020, 230001, 230034, "timeout")]
+    cases += [("parent_then_home", lane, home_kind, 232009)
+              for home_kind in ("missing", "same_chat", "wrong_platform", "blank", "topic")
+              for lane in ("normal", "background")]
+    results = []
+    for policy, lane, home_kind, failure in cases:
+        with pytest.MonkeyPatch.context() as mp:
+            profile_config(home, home_kind)
+            mp.setenv("HERMES_HOME", str(home))
+            for name in ("FEISHU_HOME_CHANNEL", "LARK_HOME_CHANNEL"):
+                mp.delenv(name, raising=False)
+            ctrl, client = controller(home, mp)
+            mp.setattr(adapter_delivery, "asyncio", NS(**{**vars(asyncio), "sleep": AsyncMock()}))
+            event = event_for()
+            event.source.platform = Platform.FEISHU
+            event.reply_to_message_id = event.anchor
+            core = core_adapter(policy, "stale")
+            messages = core._client.im.v1.message
+
+            def create(request, failure=failure):
+                if request.request_body.receive_id == "oc_origin":
+                    if failure == "timeout":
+                        raise TimeoutError("Synthetic ambiguous parent send")
+                    return bad(failure)
+                assert request.request_body.receive_id == "oc_home"
+                return ok(message_id="om_home_created")
+
+            def history(request):
+                if request.container_id == "omt_home":
+                    return ok(items=[NS(message_id="om_home_anchor", thread_id="omt_home")])
+                assert request.container_id == "omt_topic"
+                return ok(items=[])
+
+            messages.create.side_effect = create
+            messages.list.side_effect = history
+            messages.reply.side_effect = lambda request: (
+                ok(message_id="om_home_reply") if request.message_id == "om_home_anchor" else bad(230011)
+            )
+            if lane == "background":
+                await native_background(generated, core, event, mp, attachments=True)
+            else:
+                if lane == "status":
+                    await core.send(event.source.chat_id, "STATUS_BODY", metadata=metadata(event))
+                if lane != "active_card":
+                    client._client.im.v1.message.areply.return_value = bad(230011)
+                generated_start(event)
+                await ctrl._sessions[event.message_id].create_task
+                if lane == "active_card":
+                    await core.send(event.source.chat_id, "STATUS_BODY", metadata=metadata(event))
+                result, text = await generated_complete(event)
+                await native_final(generated, core, event, result, text)
+
+            plugin_messages = client._client.im.v1.message
+            assert plugin_messages.acreate.await_count == 0, (policy, lane, home_kind, failure)
+            client.cardkit_update.assert_not_awaited()
+            creates = [call.args[0] for call in messages.create.call_args_list]
+            replies = [call.args[0] for call in messages.reply.call_args_list]
+            lists = [call.args[0] for call in messages.list.call_args_list]
+            assert all(isinstance(request, CreateMessageRequest) for request in creates)
+            assert all(isinstance(request, ReplyMessageRequest) for request in replies)
+            assert all(isinstance(request, ListMessageRequest) for request in lists)
+            parent = [request for request in creates if request.request_body.receive_id == "oc_origin"]
+            home_sends = [request for request in creates if request.request_body.receive_id == "oc_home"]
+            home_replies = [request for request in replies if request.message_id == "om_home_anchor"]
+            should_use_home = policy == "parent_then_home" and failure == 232009 and home_kind in ("flat", "topic")
+            if should_use_home:
+                assert len(parent) == 1, (policy, lane, home_kind, failure)
+                home_payloads = [request.request_body.content for request in home_sends + home_replies]
+                assert len(home_payloads) == (1 if lane == "normal" else 2)
+                assert any("ORIGINAL_BODY" in payload for payload in home_payloads)
+                assert all(request.request_body.reply_in_thread is True for request in home_replies)
+                assert bool(home_replies) == (home_kind == "topic")
+                if lane in ("status", "active_card"):
+                    assert event._feishu_topic_delivery["destination"] == "home"
+            else:
+                assert not home_sends and not home_replies, (policy, lane, home_kind, failure)
+            if policy in ("error_notice", "silent"):
+                assert len(parent) <= (1 if policy == "error_notice" else 0)
+                assert not any("ORIGINAL_" in request.request_body.content or
+                               "STATUS_BODY" in request.request_body.content for request in parent)
+            if lane == "status" and should_use_home:
+                client.cardkit_create.assert_not_awaited()
+            results.append({"policy": policy, "lane": lane, "home": home_kind,
+                            "parent_failure": failure, "native_parent": len(parent),
+                            "native_home": len(home_sends) + len(home_replies),
+                            "plugin_parent": plugin_messages.acreate.await_count})
+            executor = getattr(core, "_sdk_executor", None)
+            if executor:
+                executor.shutdown(wait=True)
     return results
 
 
@@ -271,6 +390,7 @@ def main():
         assert all(path.read_bytes() == content for path, content in installed.items())
         generated = {name: (target / "gateway" / name).read_text() for name in GATEWAY_FILES}
         results = asyncio.run(run_matrix(generated, target))
+        home_results = asyncio.run(run_home_matrix(generated, target))
         for patcher in patchers:
             patcher.remove()
         assert all((target / file.relative_to(ROOT)).read_bytes() == file.read_bytes() for file in files)
@@ -278,7 +398,7 @@ def main():
     assert checksum(files) == before
     print(json.dumps({"core_commit": before_identity[0], "core_tree": before_identity[1],
                       "roundtrip": "byte-identical", "sdk": "real lark-oapi, explicitly loaded",
-                      "cases": results}, indent=2))
+                      "cases": results, "home_cases": home_results}, indent=2))
 
 
 if __name__ == "__main__":

@@ -178,7 +178,7 @@ def test_normalize_repairs_only_proven_legacy_quote(tmp_path, monkeypatch, nativ
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["terminal", "main_chat", "recovered", "redirect"])
+@pytest.mark.parametrize("changed", ["terminal", "parent_chat", "home", "recovered", "redirect"])
 @pytest.mark.parametrize("before_creation", [False, True])
 async def test_native_routing_change_yields_cards(tmp_path, monkeypatch, changed, before_creation):
     ctrl, client = controller(tmp_path, monkeypatch)
@@ -189,8 +189,8 @@ async def test_native_routing_change_yields_cards(tmp_path, monkeypatch, changed
         await session.create_task
     if changed == "terminal":
         event._feishu_topic_delivery = {"terminal": NS(retry_suppressed=True)}
-    elif changed == "main_chat":
-        event._feishu_topic_delivery = {"destination": "main_chat"}
+    elif changed in {"parent_chat", "home"}:
+        event._feishu_topic_delivery = {"destination": changed}
     elif changed == "recovered":
         event._feishu_topic_delivery = {"anchor": "om_recovered"}
     else:
@@ -257,7 +257,7 @@ async def test_native_terminal_during_seal_close_stops_full_card_update(tmp_path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("changed", ["terminal", "redirect"])
+@pytest.mark.parametrize("changed", ["terminal", "parent_chat", "home", "redirect"])
 async def test_native_change_during_final_update_does_not_claim_delivery(tmp_path, monkeypatch, changed):
     ctrl, client = controller(tmp_path, monkeypatch)
     event = event_for()
@@ -267,6 +267,8 @@ async def test_native_change_during_final_update_does_not_claim_delivery(tmp_pat
     async def change_during_update(*_args, **_kwargs):
         if changed == "terminal":
             event._feishu_topic_delivery = {"terminal": NS(retry_suppressed=True)}
+        elif changed in {"parent_chat", "home"}:
+            event._feishu_topic_delivery = {"destination": changed}
         else:
             event.ledger_message_id = "om_redirect"
             event.reply_anchor_override = "om_redirect_anchor"
@@ -281,14 +283,17 @@ async def test_native_change_during_final_update_does_not_claim_delivery(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_topic_retry_rechecks_native_ownership_and_restores_scope(tmp_path, monkeypatch):
+@pytest.mark.parametrize("changed", ["terminal", "parent_chat", "home"])
+async def test_topic_retry_rechecks_native_ownership_and_restores_scope(tmp_path, monkeypatch, changed):
     _ctrl, client = controller(tmp_path, monkeypatch)
     event = event_for()
     replies = client._client.im.v1.message.areply
     replies.side_effect = [bad(2200), ok(message_id="om_later_flat_reply")]
 
     async def stop_during_retry_delay(_delay):
-        event._feishu_topic_delivery = {"terminal": NS(retry_suppressed=True)}
+        event._feishu_topic_delivery = (
+            {"terminal": NS(retry_suppressed=True)} if changed == "terminal" else {"destination": changed}
+        )
 
     sleep = AsyncMock(side_effect=stop_during_retry_delay)
     monkeypatch.setattr(feishu_module.asyncio, "sleep", sleep)

@@ -56,18 +56,23 @@ When long conversations or excessive tool steps cause the card to approach Feish
 Hermes remains the sole owner of topic recovery and the
 `platforms.feishu.extra.topic_delivery_fallback` setting:
 
-- `main_chat` (default): deliver the original response to the parent chat when topic recovery is exhausted
+- `parent_chat` (default): deliver the original response to the original parent chat when topic recovery is exhausted
+- `parent_then_home`: try the original parent chat first; only when Feishu confirms that group is dissolved (`232009`), try the same profile's Feishu HomeChannel
 - `error_notice`: send only Hermes's safe diagnostic to the parent chat
 - `silent`: record the failure in backend logs without a parent-chat message
 
 These modes require a Hermes build that implements the setting. This plugin does
 not add or reinterpret the policy on older Hermes versions.
+`main_chat` is no longer a valid setting; replace it with `parent_chat`.
+Home fallback is opt-in and requires a distinct, valid Feishu HomeChannel in the
+same profile. Permissions, rate limits, invalid recipients, generic errors, and
+pending or ambiguous sends do not trigger a second destination.
 
 Valid topic conversations still use streaming cards with explicit in-thread
 replies. Failed topic card creation yields the complete response to Hermes;
-it never creates a parent-chat card as its own fallback. Topic background and
+it never creates a parent-chat or HomeChannel card as its own fallback. Topic background and
 cron deliveries stay native, including attachment handling. When Hermes stops,
-recovers, or redirects a turn's destination, the old card yields to native
+recovers, selects the parent chat or HomeChannel, or redirects a turn's destination, the old card yields to native
 completion. Already-submitted requests cannot be recalled; subsequent updates
 and retries check that the card still owns delivery.
 
